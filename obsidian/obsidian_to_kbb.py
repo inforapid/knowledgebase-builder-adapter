@@ -138,6 +138,9 @@ def strip_tags(html):
     """Rough text extraction from arbitrary HTML - used for description and search content."""
     html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
     html = re.sub(r"(?i)<br[ /]*>", "\n", html)
+    # A cell ends with a space, a row with a line break - without that the cells of a table would
+    # be glued together into one word in the description and in the search content
+    html = re.sub(r"(?i)</(td|th)>", " ", html)
     html = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", html)
     text = re.sub(r"<[^>]+>", "", html)
     for entity, char in (("&nbsp;", " "), ("&lt;", "<"), ("&gt;", ">"),
@@ -319,6 +322,77 @@ def _inline_markdown(text):
     return text
 
 
+# Tables. Markdown does turn "| a | b |" into a <table>, but a table without any style has
+# neither borders nor spacing, so its cells run into one another and the whole thing reads like
+# the source text it came from. The styles below are the ones the application itself writes when
+# a table is inserted through Table -> Insert table: imported tables therefore look like hand
+# made ones and can be edited with the same table commands.
+#
+# Two details of that markup are worth keeping: the border takes its colour from the text
+# (border-color:inherit), which keeps it visible on a dark note background as well, and all sizes
+# are given in em, so the table follows the font size of the note.
+TABLE_STYLE = ("border-collapse:collapse;border-width:0.07em;border-style:solid;"
+               "border-color:inherit;padding:0.2em 0.4em;min-width:4em;min-height:1.5em;"
+               "text-align:left;vertical-align:top")
+TABLE_SECTION_STYLE = ("border-width:inherit;border-style:inherit;border-color:inherit;"
+                       "padding:inherit;min-width:inherit;min-height:inherit;"
+                       "text-align:inherit;vertical-align:inherit")
+TABLE_CELL_STYLE = ("border:inherit;padding:inherit;min-width:inherit;min-height:inherit;"
+                    "text-align:inherit;vertical-align:inherit")
+
+TABLE_TAG_RE = re.compile(r"(?i)<(/?)(table|thead|tbody|tfoot|tr|th|td)\b([^>]*?)(/?)>")
+STYLE_ATTRIBUTE_RE = re.compile(r"""(?i)\bstyle\s*=\s*("|')(.*?)\1""")
+
+
+def _with_style(attributes, style):
+    """
+    Puts style into the attributes of a tag. A style that is already there is kept and written
+    behind it, so it still wins - that is how the "text-align" of an aligned Markdown column
+    survives the "text-align:left" of the table.
+    """
+    match = STYLE_ATTRIBUTE_RE.search(attributes)
+    if not match:
+        return ' style="%s"%s' % (style, attributes)
+
+    existing = match.group(2).strip().rstrip(";").strip()
+    merged = "%s;%s" % (style, existing) if existing else style
+    return attributes[:match.start()] + 'style="%s"' % merged + attributes[match.end():]
+
+
+def style_tables(html):
+    """
+    Gives every table of the note the markup of the application, see TABLE_STYLE.
+
+    Header cells become bold <td> cells: the table commands of the application address <td> only,
+    so a <th> row would be skipped when a column is inserted, and the columns of the header and
+    of the body would drift apart. Bold and left aligned is what a <th> looks like there anyway.
+
+    Only real markup is touched. A table shown as source code inside a note sits in a <pre> block
+    with its angle brackets escaped and is left alone, and MathML is not affected either, because
+    <mtable> and <mtd> do not start with "<table" or "<td".
+    """
+    def replace(match):
+        closing, name, attributes, empty = match.group(1), match.group(2).lower(), \
+            match.group(3), match.group(4)
+
+        if closing:
+            return "</td>" if name == "th" else match.group(0)
+
+        if name == "table":
+            style = TABLE_STYLE
+        elif name in ("thead", "tbody", "tfoot"):
+            style = TABLE_SECTION_STYLE
+        elif name == "th":
+            style = TABLE_CELL_STYLE + ";font-weight:bold"
+        else:
+            style = TABLE_CELL_STYLE
+
+        return "<%s%s%s>" % ("td" if name == "th" else name,
+                             _with_style(attributes, style), empty)
+
+    return TABLE_TAG_RE.sub(replace, html)
+
+
 # ================================================================================================
 # Obsidian parsing
 # ================================================================================================
@@ -410,6 +484,9 @@ def extract_math(text):
             mathml = _latex2mathml.convert(source.strip(), display=display)
         except Exception:
             return None                                 # unconvertible: leave the source alone
+        # fix: fences like | are often rendered as non-stretching infix operators
+        # when latex2mathml leaves them in a flat <mrow>
+        mathml = mathml.replace('<mo>&#x0007C;</mo>', '<mo stretchy="true">&#x0007C;</mo>')
         formulas.append(mathml)
         return MATH_PLACEHOLDER % (len(formulas) - 1)
 
@@ -444,6 +521,32 @@ def insert_math(html, formulas):
         return html
 
     return MATH_PLACEHOLDER_RE.sub(lambda m: formulas[int(m.group(1))], html)
+
+
+# A table must not stand inside a paragraph: HTML does not allow it, and the parser closes the
+# <p> in front of a <table> and lifts the table out of it. That does not happen while the note is
+# built, but as soon as its HTML is read and written back once - which is what the application
+# does when it draws or edits a note.
+#
+# It hits the formulas hardest. The application renders them with jqMath, and jqMath builds a
+# matrix (<mtable>) as a real HTML table. On the next round trip that table is torn out of the
+# formula around it, and the fence bars of the matrix are left standing on lines of their own.
+# A <div> may hold a table, so a paragraph that carries a formula or a table becomes one - it is
+# a block just as a paragraph is, and with the margin of a paragraph nothing changes visually.
+PARAGRAPH_RE = re.compile(r"(?is)<p(\s[^>]*)?>(.*?)</p>")
+PARAGRAPH_MARGIN = "margin:1em 0"                       # what a browser gives a <p> by itself
+TABLE_OR_MATH_RE = re.compile(r"(?i)<(table|math)\b")
+
+
+def avoid_tables_in_paragraphs(html):
+    """Turns every paragraph that holds a table or a formula into a div of the same shape."""
+    def replace(match):
+        attributes, content = match.group(1) or "", match.group(2)
+        if not TABLE_OR_MATH_RE.search(content):
+            return match.group(0)
+        return "<div%s>%s</div>" % (_with_style(attributes, PARAGRAPH_MARGIN), content)
+
+    return PARAGRAPH_RE.sub(replace, html)
 
 
 def convert_obsidian_syntax(text):
@@ -1625,7 +1728,13 @@ def build_note_html(note, assets, embed_images, notes_by_key=None, notes_by_path
     body = convert_obsidian_syntax(body)
     body = ensure_blank_line_before_blocks(body)
 
-    html = insert_mermaid(insert_math(markdown_to_html(body), formulas), diagrams)
+    # The tables are styled before the diagrams and formulas go back in: at this point they are
+    # the only markup in the text, so <mtable> of a formula cannot be mistaken for a table.
+    html = style_tables(markdown_to_html(body))
+    html = insert_mermaid(insert_math(html, formulas), diagrams)
+
+    # Only now, with the formulas back in place, can a paragraph be seen to hold a table
+    html = avoid_tables_in_paragraphs(html)
     return "<html>" + html + "</html>"
 
 
