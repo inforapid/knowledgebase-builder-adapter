@@ -26,7 +26,7 @@ opened with the desktop and mobile apps or uploaded to the web version (*Upload 
 | complete front and all remaining fields | note of the item (HTML attachment), one section per field name |
 | top deck level below the root | category of the item (`--category`) |
 | tags | tags; hierarchical tags that only repeat the deck path are dropped, others are shortened to their last part |
-| cloze `{{c1::answer::hint}}` | description with the answer highlighted — every highlight becomes a gap card; the name is the sentence with the clozes filled in |
+| cloze `{{c1::answer::hint}}` | description with the answer highlighted (`data-cloze`, `data-hint`) — one gap card per cloze number; the name is the sentence with the clozes filled in |
 | Image Occlusion | item with the image as its description (the masks are not carried over) |
 | images | embedded as `data:` URIs, scaled down to 360 px in the description and 900 px in the note |
 | formulas `\(...\)` / `\[...\]` | converted to the jqMath notation the application renders (see below) |
@@ -43,12 +43,27 @@ converts them: symbols to Unicode (`\partial` → ∂, `\times` → ×, Greek le
 environments to `\table`, `\text{...}` and functions like `\sin` to upright text. Colours, sizes and
 `\left`/`\right` are dropped. `--keep-latex` leaves the formulas untouched.
 
+### How the cards are asked
+
+The learning mode of the KnowledgeBase Builder treats an item as a term with an explanation: it
+first shows both, then asks with multiple choice in both directions, and switches to flashcards
+once a card is consolidated. Imported Anki notes are asked the way Anki asks them instead:
+
+| Note | Card in KnowledgeBase Builder |
+| --- | --- |
+| Basic (front is a question or a sentence) | one card front → back, as a flashcard from the start: think of the answer, reveal, rate *Again / Hard / Good / Easy*. No reverse direction, no multiple choice. After revealing, *Notes* shows the remaining fields (Back Extra, …). |
+| Cloze | one card per cloze number. All parts of `c1` are hidden together and show their hint, the other clozes are plain text. The back shows the whole text with the revealed parts marked. Answers that are a formula, several parts or four words and more are flashcards; single words are asked with multiple choice among other single-word clozes, and can be typed once consolidated. |
+| the note item itself (cloze) | not asked — its name and description are the same sentence |
+
+These rules are part of the learning mode, not of the importer: they apply to every item whose
+name is a question or a sentence and to every highlight with `data-cloze`.
+
 ### Learning state
 
 KnowledgeBase Builder schedules with FSRS. Cards that Anki already schedules with FSRS keep their
 stability and difficulty; for SM-2 cards the interval is taken as stability and the difficulty is
-derived from the ease factor. A cloze card `c2` is assigned to the gap cards of the second cloze,
-for other note types the most advanced card of the note counts for the description card. The rows
+derived from the ease factor. A cloze card `c2` is assigned to the gap card of cloze number 2, for
+other note types the most advanced card of the note counts for the front → back card. The rows
 are written for the user `_default_user_`, which is the one the web application and the apps use.
 
 ## Requirements
@@ -121,8 +136,11 @@ Instead of a `.kdb`, a JSON file written by *Export JSON data* can be exported a
   `.apkg` it came from (base64, plus a smaller copy for the description).
 * A cloze inside a formula (`\(x = {{c1::2}}\)`) is left as LaTeX source, since the formula cannot
   be converted without breaking the cloze.
-* The export cannot represent relations between items — Anki has none — and overlapping clozes
-  come back numbered `c1`, `c2`, … in order.
+* The export cannot represent relations between items — Anki has none. Cloze numbers and hints
+  survive the round trip through `data-cloze`/`data-hint`; highlights set by hand are numbered in
+  order. Formulas are exported in the converted jqMath notation, which MathJax in Anki does not
+  render.
+* The learning-mode rules above need the KnowledgeBase Builder version of 2026-11 or later.
 * During the import the undo triggers are dropped and restored afterwards, and the undo log is
   cleared — a bulk import is not meant to be undone step by step. The database is upgraded to
   version 5 (tag tables and the learning tables).

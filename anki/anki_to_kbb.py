@@ -100,12 +100,17 @@ CLOZE = re.compile(r"\{\{c(\d+)::(.*?)(?:::(.*?))?\}\}", re.S)
 
 
 def cloze_to_highlight(text):
-    """Turns cloze deletions into highlights; also returns the cloze numbers in highlight order."""
+    """Turns cloze deletions into highlights. data-cloze keeps the Anki number, so the learning mode
+    hides all parts of c1 together (one card per number, as in Anki); data-hint keeps the hint.
+    Also returns the cloze numbers in order of their first appearance - the order of the gap cards."""
     numbers = []
 
     def replace(match):
-        numbers.append(int(match.group(1)))
-        return '<span style="%s">%s</span>' % (HIGHLIGHT, match.group(2))
+        number = int(match.group(1))
+        if number not in numbers:
+            numbers.append(number)
+        hint = ' data-hint="%s"' % html.escape(strip_html(match.group(3)), quote=True) if match.group(3) else ""
+        return '<span data-cloze="%d"%s style="%s">%s</span>' % (number, hint, HIGHLIGHT, match.group(2))
     return CLOZE.sub(replace, text), numbers
 
 
@@ -857,19 +862,21 @@ def import_package(args, db):
             writer.add_relation(parent, item_id)
             stats["notes"] += 1
 
-            # Learning state. Cloze: Anki card ord k asks for cloze c(k+1) -> every KBB gap card
-            # (n-th highlight) with that number. Otherwise the most advanced card of the note counts
-            # for the description card.
+            # Learning state. Cloze: Anki card ord k asks for cloze c(k+1), which is one gap card in
+            # KBB (gap index = position of the number in order of first appearance). Otherwise the
+            # most advanced card of the note counts for the description card.
             progressed = False
             if cloze_numbers:
                 for card in cards:
-                    gaps = [i for i, n in enumerate(cloze_numbers[:MAX_GAPS]) if n == card["ord"] + 1]
+                    number = card["ord"] + 1
+                    if number not in cloze_numbers[:MAX_GAPS]:
+                        continue
+                    gap = cloze_numbers.index(number)
+                    card_target[card["id"]] = (item_id, 6, gap)
                     values = learn_values(card, collection.crt)
-                    for gap in gaps:
-                        card_target.setdefault(card["id"], (item_id, 6, gap))
-                        if values:
-                            writer.set_progress(item_id, 6, gap, values)
-                            progressed = True
+                    if values:
+                        writer.set_progress(item_id, 6, gap, values)
+                        progressed = True
             else:
                 best = None
                 for card in cards:
@@ -1089,7 +1096,7 @@ def export_text(args):
     out.write("#separator:tab\n#html:true\n#notetype column:1\n#deck column:2\n#tags column:5\n")
     writer = csv.writer(out, delimiter="\t", quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
     count = cloze = 0
-    marker = re.compile(r'<span[^>]*background-color[^>]*>(.*?)</span>', re.I | re.S)
+    marker = re.compile(r'<span([^>]*background-color[^>]*)>(.*?)</span>', re.I | re.S)
     for node in nodes.values():
         description = unwrap_html(node.get("description"))
         if not strip_html(description) and "<img" not in description:
@@ -1102,8 +1109,15 @@ def export_text(args):
             number = [0]
 
             def to_cloze(match):
-                number[0] += 1
-                return "{{c%d::%s}}" % (number[0], match.group(1))
+                # the Anki number survives in data-cloze (overlapping clozes stay together), otherwise count
+                given = re.search(r'data-cloze="(\d+)"', match.group(1))
+                hint = re.search(r'data-hint="([^"]*)"', match.group(1))
+                if given:
+                    value = int(given.group(1))
+                else:
+                    number[0] += 1
+                    value = number[0]
+                return "{{c%d::%s%s}}" % (value, match.group(2), "::" + html.unescape(hint.group(1)) if hint else "")
             writer.writerow(["Cloze", path(node["id"]), marker.sub(to_cloze, description), name, " ".join(tags)])
             cloze += 1
         else:
