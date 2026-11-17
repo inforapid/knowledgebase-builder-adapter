@@ -55,7 +55,7 @@ FIELD_SEPARATOR = "\x1f"
 HIGHLIGHT = "background-color:#fef08a"
 DAY_MS = 86400000
 DEFAULT_USER = "_default_user_"         # user of the web application and the apps (sqlitedataaccess.php)
-SKIP_FIELDS = {"deck id", "image size", "occlusion"}   # technical fields of common note types
+SKIP_FIELDS = {"deck id", "image size", "occlusion", "verdeckung", "note id", "date stamp", "source"}   # technical fields of common note types
 MAX_GAPS = 9                            # the application evaluates at most nine highlights per item
 
 # ------------------------------------------------------------------------------------------------
@@ -123,12 +123,52 @@ def is_cloze(fields):
 
 
 def tag_name(tag, deck_tag_prefixes):
-    """Anki tag -> KBB tag. None when the tag only repeats the deck path."""
+    """Anki tag -> KBB tag (--all-tags). None when the tag only repeats the deck path."""
     if re.sub(r"[\s_]+", "", tag.split("::", 1)[0]).lower() in deck_tag_prefixes:
         return None
     if "::" in tag:
         tag = tag.rsplit("::", 1)[1]
-    return tag.replace("_", " ").strip() or None
+    return clean_tag(tag)
+
+
+def clean_tag(tag):
+    # A leading # marks special tags in KBB (#nolearn, #hidden, #board) - drop such markers
+    return re.sub(r"^[#$!§%&*+~]+", "", tag).replace("_", " ").strip() or None
+
+
+def build_tag_map(notes_tags, deck_tag_prefixes, min_notes):
+    """Anki tag -> KBB tag name or None. Large shared decks carry thousands of nested tags (curricula of
+    single universities, study plans) next to a few flags ("!Physikum", "!High-Yield"). Kept are the flags:
+    tags that are a single level below a prefix shared by most tags (e.g. "#Deck_v6.0::"), used by at least
+    min_notes notes. Tags that repeat the deck path are dropped."""
+    counts = {}
+    for tags in notes_tags:
+        for tag in set(tags):
+            counts[tag] = counts.get(tag, 0) + 1
+
+    nested = [t for t in counts if "::" in t]
+    first = {}
+    for tag in nested:
+        head = tag.split("::", 1)[0]
+        first[head] = first.get(head, 0) + 1
+    prefix = None
+    if nested:
+        head, number = max(first.items(), key=lambda item: item[1])
+        if number >= 0.8 * len(nested) and number >= 0.5 * len(counts):
+            prefix = head + "::"
+
+    result = {}
+    for tag, number in counts.items():
+        rest = tag[len(prefix):] if prefix and tag.startswith(prefix) else tag
+        if re.sub(r"[\s_]+", "", tag.split("::", 1)[0]).lower() in deck_tag_prefixes:
+            result[tag] = None
+        elif re.sub(r"[\s_]+", "", rest.split("::", 1)[0]).lower() in deck_tag_prefixes:
+            result[tag] = None
+        elif "::" in rest or number < min_notes:
+            result[tag] = None
+        else:
+            result[tag] = clean_tag(rest)
+    return result
 
 
 # ------------------------------------------------------------------------------------------------
@@ -427,6 +467,7 @@ class MediaStore(object):
         self.package = package
         self.enabled = enabled and package is not None
         self.max_bytes = max_bytes
+        self.jpeg_quality = 80
         self.by_name = read_media_map(package) if package is not None else {}
         self.cache = {}
         self.embedded = 0
@@ -449,18 +490,28 @@ class MediaStore(object):
                 image = _Image.open(io.BytesIO(data))
                 animated = getattr(image, "is_animated", False)
                 too_big = max(image.size) > max_edge
-                if (too_big and not animated) or (animated and len(data) > self.max_bytes):
+                if (not animated) or (len(data) > self.max_bytes):
+                    # Scale down if needed and store as JPEG whenever that is smaller and loses no
+                    # transparency - images are embedded once per note, and shared decks reuse them in
+                    # many notes (AMBOSS Vorklinik: 1266 images in 5001 places)
                     image.seek(0)
+                    transparent = ("A" in image.getbands()) or ("transparency" in image.info)
                     if image.mode not in ("RGB", "RGBA"):
-                        image = image.convert("RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB")
-                    image.thumbnail((max_edge, max_edge))
-                    buffer = io.BytesIO()
-                    if mime == "image/jpeg" and image.mode == "RGB":
-                        image.save(buffer, format="JPEG", quality=85)
-                    else:
+                        image = image.convert("RGBA" if transparent else "RGB")
+                    if too_big:
+                        image.thumbnail((max_edge, max_edge))
+                    candidates = []
+                    if not transparent:
+                        buffer = io.BytesIO()
+                        image.convert("RGB").save(buffer, format="JPEG", quality=self.jpeg_quality, optimize=True)
+                        candidates.append((buffer.getvalue(), "image/jpeg"))
+                    if transparent or mime == "image/png":
+                        buffer = io.BytesIO()
                         image.save(buffer, format="PNG", optimize=True)
-                        mime = "image/png"
-                    data = buffer.getvalue()
+                        candidates.append((buffer.getvalue(), "image/png"))
+                    if not too_big:
+                        candidates.append((data, mime))      # the original may be the smallest
+                    data, mime = min(candidates, key=lambda candidate: len(candidate[0]))
             except Exception:
                 pass
         if len(data) > self.max_bytes:
@@ -499,7 +550,7 @@ class Collection(object):
         tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.new_schema = "notetypes" in tables
         self.crt = cur.execute("SELECT crt FROM col").fetchone()[0]
-        self.notetypes = {}   # id -> {"name", "fields": [..], "cloze": bool}
+        self.notetypes = {}   # id -> {"name", "fields": [..], "templates": [..], "cloze": bool}
         self.decks = {}       # id -> name with "::"
 
         if self.new_schema:
@@ -512,10 +563,16 @@ class Collection(object):
                             cloze = True
                 except Exception:
                     pass
-                self.notetypes[ntid] = {"name": name, "fields": [], "cloze": cloze}
+                self.notetypes[ntid] = {"name": name, "fields": [], "templates": [], "cloze": cloze}
             for ntid, _ord, name in raw.execute("SELECT ntid, ord, name FROM fields ORDER BY ntid, ord"):
                 if ntid in self.notetypes:
                     self.notetypes[ntid]["fields"].append(name)
+            try:
+                for ntid, _ord, name in raw.execute("SELECT ntid, ord, name FROM templates ORDER BY ntid, ord"):
+                    if ntid in self.notetypes:
+                        self.notetypes[ntid]["templates"].append(name)
+            except sqlite3.Error:
+                pass
             for did, name in raw.execute("SELECT id, name FROM decks"):
                 self.decks[did] = name.replace("\x1f", "::")
             raw.close()
@@ -525,6 +582,7 @@ class Collection(object):
                 self.notetypes[int(mid)] = {
                     "name": model.get("name", "Note type"),
                     "fields": [f.get("name", "") for f in sorted(model.get("flds", []), key=lambda f: f.get("ord", 0))],
+                    "templates": [t.get("name", "") for t in sorted(model.get("tmpls", []), key=lambda t: t.get("ord", 0))],
                     "cloze": model.get("type") == 1,
                 }
             for did, deck in json.loads(decks_json or "{}").items():
@@ -651,6 +709,10 @@ class KdbWriter(object):
         self.deck_template = db.get_or_create_item_template(deck_category)
         self.templates = {}
         self.deck_ids = {}
+        self.value_ids = {}
+        self.group_ids = {}
+        self.max_children = 25
+        self.group_label = "Part %s · %s"
         self.touched = set()
         self.root_name = root_name
         self.root = self.add_item(root_name, "", "", self.deck_template, [])
@@ -683,9 +745,45 @@ class KdbWriter(object):
             self.db.attach_record(item_id, record_id, 0)
         return item_id
 
-    def add_relation(self, source, target):
-        self.db.new_relation(source, target, -1, self.relation_label, "")
+    def add_relation(self, source, target, label=None):
+        relation_id = self.db.new_relation(source, target, -1, self.relation_label if label is None else label, "")
         self.touched.update((source, target))
+        return relation_id
+
+    def group_parent(self, deck_item, deck_key, index, total, label):
+        """Parent for the index-th note of a deck with total notes. The diagram loads about 100 items at
+        once, so a deck with more than max_children notes is split into groups of max_children
+        ("Teil 3 · <first card>"), and into groups of groups when even those are too many."""
+        size = self.max_children
+        if size <= 1 or total <= size:
+            return deck_item
+        levels = 1
+        while size ** (levels + 1) < total:
+            levels += 1
+        parent = deck_item
+        path = []
+        for level in range(levels, 0, -1):
+            number = index // (size ** level)
+            path.append(number % size if level < levels else number)
+            key = (deck_key, tuple(path))
+            if key not in self.group_ids:
+                title = self.group_label % (".".join(str(p + 1) for p in path), shorten(label, 40))
+                self.group_ids[key] = self.add_item(title, "", "", self.deck_template, [])
+                self.add_relation(parent, self.group_ids[key])
+            parent = self.group_ids[key]
+        return parent
+
+    def value_item(self, text, category_id):
+        """Shared item for a field value (e.g. a nerve that innervates several muscles)."""
+        key = (text.lower(), category_id)
+        if key not in self.value_ids:
+            self.value_ids[key] = self.add_item(text, "", "", category_id, [])
+        return self.value_ids[key]
+
+    def set_relation_progress(self, relation_id, values):
+        self.db.cur.execute("INSERT OR REPLACE INTO LearnProgress VALUES(?,1,?,1,0,?,?,?,?,?,?,?,?)",
+                            (self.user_id, relation_id) + tuple(values))
+        self.learn_rows += 1
 
     def deck(self, full_name):
         """Deck 'A::B::C' as a chain of items below the root."""
@@ -781,8 +879,19 @@ def import_package(args, db):
         writer = KdbWriter(db, root_name, args.relation, args.deck_category)
         deck_tag_prefixes = {re.sub(r"[\s_]+", "", d).lower() for d in main_decks}
         cards_by_note = collection.cards()
+        writer.max_children = args.max_children
+        writer.group_label = args.group_label
+        deck_totals = {}         # deck -> number of notes, for splitting large decks into groups
+        for note_cards in cards_by_note.values():
+            deck_key = note_cards[0]["deck"]
+            deck_totals[deck_key] = deck_totals.get(deck_key, 0) + 1
+        deck_positions = {}
         card_target = {}         # Anki card ID -> (ItemID, KBB card type, direction)
-        stats = {"notes": 0, "cloze": 0, "imageOcclusion": 0, "withProgress": 0, "empty": 0}
+        stats = {"notes": 0, "cloze": 0, "imageOcclusion": 0, "fieldCards": 0, "withProgress": 0, "empty": 0}
+        tag_map = None
+        if not args.all_tags:
+            note_tags = [note["tags"] for note in collection.notes()]
+            tag_map = build_tag_map(note_tags, deck_tag_prefixes, max(3, int(0.005 * len(note_tags))))
 
         for note in collection.notes():
             notetype = collection.notetypes.get(note["mid"], {"name": "Note type", "fields": [], "cloze": False})
@@ -799,10 +908,15 @@ def import_package(args, db):
             used = set(i for i, n in enumerate(names) if n.lower() in SKIP_FIELDS)
             cloze_numbers = []
             lower_type = notetype["name"].lower()
+            # Field cards: templates named after fields ("Ursprung", "Ansatz", ...) ask one field each - in
+            # KBB these become labelled relations to shared value items
+            lower_names = [n.lower() for n in names]
+            answer_fields = [lower_names.index(t.lower()) for t in notetype.get("templates", []) if t.lower() in lower_names]
+            field_cards = (len(answer_fields) >= 2) and not notetype["cloze"]
 
-            if "image occlusion" in lower_type or "bildverdeckung" in lower_type:
+            if "occlusion" in lower_type or "bildverdeckung" in lower_type:
                 stats["imageOcclusion"] += 1
-                header = field_index(names, ["header", "kopfzeile"])
+                header = field_index(names, ["header", "kopfzeile", "titel", "title"])
                 image = field_index(names, ["image", "bild"])
                 label = strip_html(raw[header]) if header >= 0 else ""
                 label = label or "Image Occlusion %d" % stats["imageOcclusion"]
@@ -816,6 +930,14 @@ def import_package(args, db):
                 label = strip_html(cloze_reveal(raw[text]))
                 description, cloze_numbers = cloze_to_highlight(raw[text])
                 used.add(text)
+                front_full = ""
+            elif field_cards:
+                stats["fieldCards"] += 1
+                name_field = min(answer_fields) - 1 if min(answer_fields) > 0 else 0
+                label = strip_html(raw[name_field])
+                lines = ["<b>%s:</b> %s" % (html.escape(names[i]), raw[i]) for i in answer_fields if has_content(raw[i])]
+                description = "<br>".join(lines)
+                used.update([name_field] + answer_fields)
                 front_full = ""
             else:
                 front = 0
@@ -844,7 +966,7 @@ def import_package(args, db):
 
             tag_ids = []
             for tag in note["tags"]:
-                name = tag_name(tag, deck_tag_prefixes)
+                name = tag_map.get(tag) if tag_map is not None else tag_name(tag, deck_tag_prefixes)
                 if name:
                     tag_ids.append(writer.template(name))
 
@@ -857,10 +979,34 @@ def import_package(args, db):
             else:
                 category_id = -1
 
+            deck_key = cards[0]["deck"] if cards else None
+            position = deck_positions.get(deck_key, 0)
+            deck_positions[deck_key] = position + 1
+            parent = writer.group_parent(parent, deck_key, position, deck_totals.get(deck_key, 0), label)
+
             item_id = writer.add_item(shorten(label, args.max_name) or "(no text)", description, note_html,
                                       category_id, tag_ids)
             writer.add_relation(parent, item_id)
             stats["notes"] += 1
+
+            # Field cards: one labelled relation per answer field to a shared value item; the Anki card
+            # of template k carries its learning state to the relation card "Name — field → ?"
+            if field_cards:
+                relation_by_field = {}
+                for i in answer_fields:
+                    value = shorten(strip_html(raw[i]), args.max_name)
+                    if value:
+                        target = writer.value_item(value, writer.template(names[i]))
+                        relation_by_field[i] = writer.add_relation(item_id, target, names[i])
+                for card in cards:
+                    if card["ord"] < len(notetype.get("templates", [])):
+                        template = notetype["templates"][card["ord"]].lower()
+                        field = lower_names.index(template) if template in lower_names else -1
+                        values = learn_values(card, collection.crt)
+                        if field in relation_by_field and values:
+                            writer.set_relation_progress(relation_by_field[field], values)
+                            stats["withProgress"] += 1
+                continue
 
             # Learning state. Cloze: Anki card ord k asks for cloze c(k+1), which is one gap card in
             # KBB (gap index = position of the number in order of first appearance). Otherwise the
@@ -938,7 +1084,7 @@ def import_text(args, db):
 
     root_name = args.root_name or os.path.splitext(os.path.basename(args.input))[0]
     writer = KdbWriter(db, root_name, args.relation, args.deck_category)
-    stats = {"notes": 0, "cloze": 0, "imageOcclusion": 0, "withProgress": 0, "empty": 0}
+    stats = {"notes": 0, "cloze": 0, "imageOcclusion": 0, "fieldCards": 0, "withProgress": 0, "empty": 0}
     default_type = "Quizlet" if not header else "Basic"
 
     reader = csv.reader(io.StringIO(body), delimiter=separator, quotechar='"') if len(separator) == 1 else \
@@ -989,6 +1135,22 @@ def import_text(args, db):
     return stats, ["Text read, separator %r, HTML %s." % (separator, "yes" if is_html else "no")]
 
 
+# Diagram formatting of a new database, the keys the formatting gallery writes into "dp".
+DIAGRAM_PROPERTIES = {
+    "dl": 1,       # layout: mind map radial (straight lines)
+    "iex": 0,      # items collapsed - an expanded deck shows every answer at once
+}
+
+
+def set_diagram_layout(db):
+    try:
+        properties = json.loads(db.get_diagram_property("dp") or "{}")
+    except ValueError:
+        properties = {}
+    properties.update(DIAGRAM_PROPERTIES)
+    db.set_diagram_property("dp", json.dumps(properties, separators=(",", ":")))
+
+
 def run_import(args):
     target = os.path.abspath(args.db)
     if os.path.exists(target):
@@ -1009,6 +1171,8 @@ def run_import(args):
             stats, hints = import_package(args, db)
         else:
             stats, hints = import_text(args, db)
+        if not args.append:
+            set_diagram_layout(db)
         db.enable_undo_triggers()
         db.cur.execute("DELETE FROM UndoLog")
         db.commit()
@@ -1026,7 +1190,7 @@ def run_import(args):
     con.close()
     for hint in hints:
         print(hint)
-    print("Notes: %(notes)d (cloze %(cloze)d, image occlusion %(imageOcclusion)d, empty skipped %(empty)d), "
+    print("Notes: %(notes)d (cloze %(cloze)d, image occlusion %(imageOcclusion)d, field cards %(fieldCards)d, empty skipped %(empty)d), "
           "with learning state %(withProgress)d" % stats)
     print("Database: %s - %d items, %d relations, %d categories/tags, %.1f MB, %.1f s" % (
         target, counts[0], counts[1], counts[2], os.path.getsize(target) / 1048576.0, time.time() - started))
@@ -1153,7 +1317,13 @@ def main():
     imp.add_argument("--no-media", dest="media", action="store_false", help="do not embed images")
     imp.add_argument("--max-media-kb", type=int, default=1500, help="do not embed larger images")
     imp.add_argument("--description-image-edge", type=int, default=360, help="edge length of images in the description")
-    imp.add_argument("--note-image-edge", type=int, default=900, help="edge length of images in the note")
+    imp.add_argument("--note-image-edge", type=int, default=700, help="edge length of images in the note")
+    imp.add_argument("--max-children", type=int, default=25,
+                     help="split decks with more notes into groups of this size (0 = never)")
+    imp.add_argument("--group-label", default="Part %s · %s",
+                     help="name of a group: number and start of its first card, e.g. 'Teil %%s · %%s'")
+    imp.add_argument("--all-tags", action="store_true",
+                     help="keep every tag (shortened to its last part) instead of only the single-level flags")
     imp.add_argument("--keep-latex", dest="convert_math", action="store_false",
                      help="do not convert formulas to the jqMath notation of the application")
     imp.add_argument("--separator", help="text: separator between term and definition")

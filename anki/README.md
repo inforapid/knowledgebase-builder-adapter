@@ -20,15 +20,16 @@ opened with the desktop and mobile apps or uploaded to the web version (*Upload 
 | Anki | KnowledgeBase Builder |
 | --- | --- |
 | deck and subdecks (`A::B::C`) | chain of items of the category `Deck` below a root item |
-| note | item below its deck |
+| note | item below its deck; decks with more than `--max-children` (25) notes are split into groups of 25 in Anki order, and into groups of groups when needed – the diagram loads about 100 items at once. A group is named after its number and the start of its first card (`--group-label`, e.g. `"Teil %s · %s"` → *Teil 3 · Glykolyse …*) |
 | first field (front) | name of the item, as plain text and shortened to `--max-name` characters |
 | `Back` / `Answer` field (otherwise the next field with content) | description of the item |
 | complete front and all remaining fields | note of the item (HTML attachment), one section per field name |
 | top deck level below the root | category of the item (`--category`) |
-| tags | tags; hierarchical tags that only repeat the deck path are dropped, others are shortened to their last part |
+| tags | only single-level flags such as `!Physikum` or `High-Yield` (below a prefix shared by most tags, used by at least 0.5 % of the notes), without leading `#`/`!`/`$`/`§` – `#` marks special tags in KBB. Nested curricula and tags that repeat the deck path are dropped; `--all-tags` keeps every tag shortened to its last part |
+| note type with one card per field (templates named after fields, e.g. *Ursprung*, *Ansatz*, *Funktion*, *Innervation*) | the field before the asked fields becomes the item (*M. supraspinatus*), every asked field a labelled relation to a shared value item (*Innervation → N. suprascapularis*, shared by all muscles with that nerve) – relation cards instead of one card per field; the description lists all fields |
 | cloze `{{c1::answer::hint}}` | description with the answer highlighted (`data-cloze`, `data-hint`) — one gap card per cloze number; the name is the sentence with the clozes filled in |
-| Image Occlusion | item with the image as its description (the masks are not carried over) |
-| images | embedded as `data:` URIs, scaled down to 360 px in the description and 900 px in the note |
+| Image Occlusion (any note type with *occlusion* in its name) | item named after the header/title field with the image as its description; the masks are not carried over, and since the description has no text the learning mode asks no card for it |
+| images | embedded as `data:` URIs, scaled down to 360 px in the description and 700 px in the note, stored as JPEG (quality 80) whenever that is smaller and the image has no transparency |
 | formulas `\(...\)` / `\[...\]` | converted to the jqMath notation the application renders (see below) |
 | `[sound:...]` | dropped |
 | learning state (FSRS, or SM-2 approximated) | table `LearnProgress` |
@@ -52,7 +53,10 @@ once a card is consolidated. Imported Anki notes are asked the way Anki asks the
 | Note | Card in KnowledgeBase Builder |
 | --- | --- |
 | Basic (front is a question or a sentence) | one card front → back, as a flashcard from the start: think of the answer, reveal, rate *Again / Hard / Good / Easy*. No reverse direction, no multiple choice. After revealing, *Notes* shows the remaining fields (Back Extra, …). |
-| Cloze | one card per cloze number. All parts of `c1` are hidden together and show their hint, the other clozes are plain text. The back shows the whole text with the revealed parts marked. Answers that are a formula, several parts or four words and more are flashcards; single words are asked with multiple choice among other single-word clozes, and can be typed once consolidated. |
+| Cloze | one card per cloze number. All parts of `c1` are hidden together, the other clozes are plain text. The back shows only the hidden parts — the sentence is already
+in the question; when a cloze has several parts, they are numbered in the question and the back
+lists one line per part with its number. The Anki hint is not part of the text, it appears as a
+tooltip on the placeholder. Answers that are a formula, several parts or four words and more are flashcards; single words are asked with multiple choice among other single-word clozes, and can be typed once consolidated. |
 | the note item itself (cloze) | not asked — its name and description are the same sentence |
 
 These rules are part of the learning mode, not of the importer: they apply to every item whose
@@ -90,7 +94,9 @@ python anki_to_kbb.py import Deck.apkg --db deck.kdb
 ```
 
 `deck.kdb` is created from `empty.kdb`. The importer refuses to overwrite an existing database;
-`--append` adds the deck to one instead.
+`--append` adds the deck to one instead. A new database opens with the layout *Mind Map radial
+(straight lines)* and collapsed items, so that the answers stay hidden until an item is opened;
+`--append` leaves the formatting of the database as it is.
 
 Text exports — Anki's *Notes in Plain Text* with its `#separator:` / `#deck column:` header lines,
 or Quizlet's *Export* with one `term<TAB>definition` per line:
@@ -125,15 +131,25 @@ Instead of a `.kdb`, a JSON file written by *Export JSON data* can be exported a
 | `--max-name N` | maximum length of an item name (default 90) |
 | `--no-media` | leave images out |
 | `--max-media-kb N` | leave out images that are still larger after scaling (default 1500) |
-| `--description-image-edge N`, `--note-image-edge N` | maximum edge length of images (default 360 / 900) |
+| `--description-image-edge N`, `--note-image-edge N` | maximum edge length of images (default 360 / 700) |
+| `--all-tags` | keep every tag (shortened to its last part) instead of only the single-level flags |
+| `--max-children N`, `--group-label TEXT` | group size for large decks (default 25, 0 = no groups) and the group name with two `%s` for number and first card (default `"Part %s · %s"`) |
 | `--keep-latex` | do not convert formulas |
 | `--separator`, `--row-separator` | separators of text imports |
 | `export --deck NAME` | name of the topmost deck of the export (default: the root item) |
 
+The learning state is deliberately not turned into tags or categories (Leitner boxes): it changes with every
+review and per card. The app shows it live instead – the *knowledge map* colours every item by its state,
+and *Learn: whole database* in the learning dialog picks due and new cards regardless of what the diagram
+currently shows.
+
 ## Notes
 
-* Images are stored inline as `data:` URIs, so a database with many images is larger than the
-  `.apkg` it came from (base64, plus a smaller copy for the description).
+* Images are stored inline as `data:` URIs, once per note that uses them, so a database with many
+  images can be larger than the `.apkg` it came from. Example: AMBOSS feat. Ankiphil Vorklinik (7541
+  notes, 1266 images used in 5001 places, 140 MB package) becomes 8435 items (318 of them groups) and 234 MB in about 50 s.
+  The web version allows 550 MB per user in total; `--note-image-edge`/`--description-image-edge` or
+  `--no-media` make the database smaller.
 * A cloze inside a formula (`\(x = {{c1::2}}\)`) is left as LaTeX source, since the formula cannot
   be converted without breaking the cloze.
 * The export cannot represent relations between items — Anki has none. Cloze numbers and hints
