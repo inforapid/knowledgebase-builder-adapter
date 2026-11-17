@@ -29,6 +29,7 @@ opened with the desktop and mobile apps or uploaded to the web version (*Upload 
 | note type with one card per field (templates named after fields, e.g. *Ursprung*, *Ansatz*, *Funktion*, *Innervation*) | the field before the asked fields becomes the item (*M. supraspinatus*), every asked field a labelled relation to a shared value item (*Innervation → N. suprascapularis*, shared by all muscles with that nerve) – relation cards instead of one card per field; the description lists all fields |
 | cloze `{{c1::answer::hint}}` | description with the answer highlighted (`data-cloze`, `data-hint`) — one gap card per cloze number; the name is the sentence with the clozes filled in |
 | Image Occlusion (any note type with *occlusion* in its name) | item named after the header/title field with the image as its description; the masks are not carried over, and since the description has no text the learning mode asks no card for it |
+| melody notes (a field `MelodyJSON`, as in sight singing, rhythm and interval decks whose card template draws the staff with a script) | the importer draws the staff itself (`music_notation.py`: treble/bass clef, key and time signature, stems, flags, beams, dots, ledger lines, accidentals, rests, ties, triplets) as an SVG in the item name below the question *Which syllables does this melody sing?* or, for rhythms, *How do you count this rhythm?*; the answer is the melody in movable do (minor on la, raised seventh *si*) with the note names and the scale degrees of the deck, or for rhythms the full counting grid: every count of the bar, each beat divided as finely as its notes need (`1 +`, `1 trip let`, `1 e + a`; compound time counted in eighths), claps in bold, held counts grey, rests in brackets. Key, time, tonic and first note go to the note. Notes that compare the staff with a recording (field `ErrorVariants`) are left out, the recordings themselves are not imported |
 | images | embedded as `data:` URIs, scaled down to 360 px in the description and 700 px in the note, stored as JPEG (quality 80) whenever that is smaller and the image has no transparency |
 | formulas `\(...\)` / `\[...\]` | converted to the jqMath notation the application renders (see below) |
 | `[sound:...]` | dropped |
@@ -137,6 +138,7 @@ Instead of a `.kdb`, a JSON file written by *Export JSON data* can be exported a
 | `--all-tags` | keep every tag (shortened to its last part) instead of only the single-level flags |
 | `--max-children N`, `--group-label TEXT` | group size for large decks (default 25, 0 = no groups) and the group name with two `%s` for number and first card (default `"Part %s · %s"`) |
 | `--keep-latex` | do not convert formulas |
+| `--lang en\|de\|es` | language of the questions the importer writes itself (melody notes), default `en` |
 | `--separator`, `--row-separator` | separators of text imports |
 | `export --deck NAME` | name of the topmost deck of the export (default: the root item) |
 
@@ -152,6 +154,10 @@ selected branch in deck order (*New cards from: Branch of …*) – select a dec
   notes, 1266 images used in 5001 places, 140 MB package) becomes 8435 items (318 of them groups) and 234 MB in about 50 s.
   The web version allows 550 MB per user in total; `--note-image-edge`/`--description-image-edge` or
   `--no-media` make the database smaller.
+* Example for melody notes: *Sight Singing – a function-first ear-reading course* (1470 notes, 39 MB of
+  recordings) becomes 1406 items with a staff each and 11 MB; the 64 error-detection notes are left out.
+  The KnowledgeBase Builder cannot play sound yet, so the cards are asked without the cadence and the
+  starting note of the Anki deck.
 * A cloze inside a formula (`\(x = {{c1::2}}\)`) is left as LaTeX source, since the formula cannot
   be converted without breaking the cloze.
 * The export cannot represent relations between items — Anki has none. Cloze numbers and hints

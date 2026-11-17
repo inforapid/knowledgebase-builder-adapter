@@ -51,6 +51,28 @@ try:
 except ImportError:
     _Image = None
 
+import music_notation  # noqa: E402  (next to this script)
+
+# Questions of melody notes (field "MelodyJSON"): the staff is the question, the syllables or the count
+# the answer. A question mark makes the learning mode ask them front -> back as a flashcard.
+MUSIC_TEXTS = {
+    "en": {"sing": "Which syllables does this melody sing?", "rhythm": "How do you count this rhythm?",
+           "key": "Key", "time": "Time", "clef": "Clef", "first": "First note", "tonic": "Tonic",
+           "notes": "Notes", "count": "Count", "degrees": "Scale degrees",
+           "legend": "bold = clap, grey = hold, ( ) = rest", "audio": "The recordings of the Anki deck (cadence, first note, "
+           "melody, drone) are not imported."},
+    "de": {"sing": "Welche Silben singt diese Melodie?", "rhythm": "Wie zählst du diesen Rhythmus?",
+           "key": "Tonart", "time": "Takt", "clef": "Schlüssel", "first": "Anfangston", "tonic": "Grundton",
+           "notes": "Noten", "count": "Zählweise", "degrees": "Stufen",
+           "legend": "fett = klatschen, grau = aushalten, ( ) = Pause", "audio": "Die Tonaufnahmen des Anki-Stapels (Kadenz, "
+           "Anfangston, Melodie, Bordun) werden nicht übernommen."},
+    "es": {"sing": "¿Qué sílabas canta esta melodía?", "rhythm": "¿Cómo cuentas este ritmo?",
+           "key": "Tonalidad", "time": "Compás", "clef": "Clave", "first": "Primera nota", "tonic": "Tónica",
+           "notes": "Notas", "count": "Conteo", "degrees": "Grados",
+           "legend": "negrita = palmada, gris = mantener, ( ) = silencio", "audio": "Las grabaciones del mazo de Anki (cadencia, primera "
+           "nota, melodía, bordón) no se importan."},
+}
+
 FIELD_SEPARATOR = "\x1f"
 HIGHLIGHT = "background-color:#fef08a"
 DAY_MS = 86400000
@@ -732,14 +754,14 @@ class KdbWriter(object):
             self.templates[key] = self.db.get_or_create_item_template(name)
         return self.templates[key]
 
-    def add_item(self, name, description, note_html, template_id, tag_ids):
+    def add_item(self, name, description, note_html, template_id, tag_ids, search_text=None):
         # Name and description only count as HTML with a leading <html> (htmlToHtml in kmap.js) -
         # without it the application shows the tags as text
         if description and re.search(r"<[a-zA-Z/!]|&[#a-zA-Z0-9]+;", description) \
                 and not description.lower().startswith("<html>"):
             description = "<html>%s</html>" % description
         item_id = self.db.new_item(template_id, name, description, "", "anki:" + unique_id())
-        self.db.set_search_text(item_id, name)
+        self.db.set_search_text(item_id, search_text if search_text is not None else name)
         if tag_ids:
             self.db.set_item_tags(item_id, list(dict.fromkeys(tag_ids)))
         if note_html:
@@ -890,7 +912,9 @@ def import_package(args, db):
             deck_totals[deck_key] = deck_totals.get(deck_key, 0) + 1
         deck_positions = {}
         card_target = {}         # Anki card ID -> (ItemID, KBB card type, direction)
-        stats = {"notes": 0, "cloze": 0, "imageOcclusion": 0, "fieldCards": 0, "withProgress": 0, "empty": 0}
+        stats = {"notes": 0, "cloze": 0, "imageOcclusion": 0, "fieldCards": 0, "withProgress": 0, "empty": 0,
+                 "melodies": 0, "audioOnly": 0}
+        texts = MUSIC_TEXTS.get(args.lang, MUSIC_TEXTS["en"])
         tag_map = None
         if not args.all_tags:
             note_tags = [note["tags"] for note in collection.notes()]
@@ -904,6 +928,18 @@ def import_package(args, db):
                 raw = [latex_to_jqmath(f) for f in raw]
             cards = cards_by_note.get(note["id"], [])
             deck_name = collection.decks.get(cards[0]["deck"], "") if cards else ""
+
+            # Melody notes (sight singing, rhythm and interval drills): the card template draws the staff
+            # from the JSON in "MelodyJSON" with a script. Notes that compare the written melody with a
+            # recording (field "ErrorVariants") cannot be asked without sound and are left out.
+            lower_field_names = [n.lower() for n in notetype["fields"]]
+            melody = None
+            if "melodyjson" in lower_field_names:
+                melody = music_notation.parse_melody(note["fields"][lower_field_names.index("melodyjson")])
+                if melody is not None and "errorvariants" in lower_field_names:
+                    stats["audioOnly"] += 1
+                    continue
+
             parent = writer.deck(deck_name)
             deck_parts = [p.strip() for p in deck_name.split("::") if p.strip()]
             if deck_parts and deck_parts[0].lower() == root_name.lower():
@@ -917,7 +953,40 @@ def import_package(args, db):
             answer_fields = [lower_names.index(t.lower()) for t in notetype.get("templates", []) if t.lower() in lower_names]
             field_cards = (len(answer_fields) >= 2) and not notetype["cloze"]
 
-            if "occlusion" in lower_type or "bildverdeckung" in lower_type:
+            name_html = None
+            if melody is not None:
+                stats["melodies"] += 1
+                rhythm = ("rhythm" in lower_type) or not melody.get("degrees")
+                question = texts["rhythm"] if rhythm else texts["sing"]
+                stage = field_index(names, ["stageid"])
+                stage_text = strip_html(raw[stage]) if stage >= 0 else ""
+                label = question
+                name_html = '<html><div>%s</div>%s</html>' % (html.escape(question), music_notation.melody_img(melody, 0.8))
+                count = music_notation.rhythm_grid_text(melody)
+                degrees = " ".join(str(d) for d in (melody.get("degrees") or []))
+                if rhythm:
+                    description = '%s<br><span style="font-size:0.8em;color:#777">%s</span>' % (
+                        music_notation.rhythm_grid_html(melody), html.escape(texts["legend"]))
+                else:
+                    description = "<b>%s</b><br>%s" % (html.escape(music_notation.solfege(melody)),
+                                                      html.escape(music_notation.note_names(melody)))
+                    if degrees:
+                        description += '<br><span style="font-size:0.8em;color:#777">%s: %s</span>' % (
+                            html.escape(texts["degrees"]), html.escape(degrees))
+                facts = [(texts["key"], "%s %s" % (melody.get("key", ""), str(melody.get("mode", "")).replace("_", " "))),
+                         (texts["time"], melody.get("timeSig", "")), (texts["clef"], melody.get("clef", ""))]
+                supports = melody.get("supports") or {}
+                if not rhythm:
+                    facts += [(texts["tonic"], supports.get("tonic", "")), (texts["first"], supports.get("firstNote", "")),
+                              (texts["notes"], music_notation.note_names(melody))]
+                facts.append((texts["count"], count))
+                if stage_text:
+                    facts.append(("Stage", stage_text))
+                description_note = "".join("<p><b>%s:</b> %s</p>" % (html.escape(k), html.escape(str(v))) for k, v in facts if v)
+                description_note += "<p><i>%s</i></p>" % html.escape(texts["audio"])
+                used.update(range(len(raw)))      # JSON, IDs and sound fields: nothing else for the note
+                front_full = ""
+            elif "occlusion" in lower_type or "bildverdeckung" in lower_type:
                 stats["imageOcclusion"] += 1
                 header = field_index(names, ["header", "kopfzeile", "titel", "title"])
                 image = field_index(names, ["image", "bild"])
@@ -965,6 +1034,8 @@ def import_package(args, db):
                 if index not in used and has_content(content):
                     sections.append(note_section(names[index], content))
             note_html = media.embed("".join(sections), args.note_image_edge) if sections else ""
+            if melody is not None:
+                note_html = description_note
             description = media.embed(description, args.description_image_edge)
 
             tag_ids = []
@@ -987,8 +1058,11 @@ def import_package(args, db):
             deck_positions[deck_key] = position + 1
             parent = writer.group_parent(parent, deck_key, position, deck_totals.get(deck_key, 0), label)
 
-            item_id = writer.add_item(shorten(label, args.max_name) or "(no text)", description, note_html,
-                                      category_id, tag_ids)
+            if name_html:
+                item_id = writer.add_item(name_html, description, note_html, category_id, tag_ids, search_text=label)
+            else:
+                item_id = writer.add_item(shorten(label, args.max_name) or "(no text)", description, note_html,
+                                          category_id, tag_ids)
             writer.add_relation(parent, item_id)
             stats["notes"] += 1
 
@@ -1048,6 +1122,9 @@ def import_package(args, db):
         hints.append("Media embedded: %d, skipped as too large: %d, missing: %d%s." % (
             media.embedded, media.skipped, media.missing, "" if _Image else " (not scaled down without Pillow)"))
         hints.append("Learning state: %d cards, review log: %d entries." % (writer.learn_rows, writer.review_rows))
+        if stats["melodies"] or stats["audioOnly"]:
+            hints.append("Melodies drawn as staff: %d; left out because they need the recordings (error detection): %d."
+                         % (stats["melodies"], stats["audioOnly"]))
         collection.con.close()
         return stats, hints
     finally:
@@ -1330,6 +1407,8 @@ def main():
                      help="keep every tag (shortened to its last part) instead of only the single-level flags")
     imp.add_argument("--keep-latex", dest="convert_math", action="store_false",
                      help="do not convert formulas to the jqMath notation of the application")
+    imp.add_argument("--lang", choices=sorted(MUSIC_TEXTS), default="en",
+                     help="language of generated questions (melody notes)")
     imp.add_argument("--separator", help="text: separator between term and definition")
     imp.add_argument("--row-separator", help="text: separator between rows (Quizlet, e.g. ';')")
 
