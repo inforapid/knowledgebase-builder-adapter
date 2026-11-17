@@ -158,6 +158,13 @@ selected branch in deck order (*New cards from: Branch of …*) – select a dec
   recordings) becomes 1406 items with a staff each and 11 MB; the 64 error-detection notes are left out.
   The KnowledgeBase Builder cannot play sound yet, so the cards are asked without the cadence and the
   starting note of the Anki deck.
+* Hand-typed clozes are repaired: `{{c1:answer}}`, `{{c1:answer:}}`, `{{c1:<b>:answer}}` and a missing
+  second closing brace (`{{c1::answer}</b>`). Anki itself shows them as plain text, but they are meant as
+  clozes. A cloze that starts inside one element and ends in another is highlighted without breaking
+  the HTML.
+* Styles pasted from web pages are dropped: font family and size, line height, `-webkit-` properties,
+  Google's `<code>` blocks and their attributes, and black or white text colour – it belongs to the
+  author's Anki theme, and white text is invisible on the light answer card. Other colours stay.
 * A cloze inside a formula (`\(x = {{c1::2}}\)`) is left as LaTeX source, since the formula cannot
   be converted without breaking the cloze.
 * The export cannot represent relations between items — Anki has none. Cloze numbers and hints

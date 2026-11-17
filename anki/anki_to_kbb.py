@@ -93,12 +93,71 @@ def strip_html(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Inline style properties copied along from web pages or editors: fonts, sizes and the text colour of the
+# author's Anki theme. White or black text was meant for one theme - on the light answer card of the
+# KnowledgeBase Builder white text is invisible. Other colours are kept, they usually mark something.
+DROPPED_STYLE = re.compile(r"(?i)^\s*(font-family|font-size|line-height|caret-color|-webkit-[a-z-]+|"
+                           r"text-wrap[a-z-]*|white-space[a-z-]*|word-spacing|letter-spacing|orphans|widows|"
+                           r"text-indent|text-transform|font-variant[a-z-]*)\s*:")
+NEUTRAL_COLOR = re.compile(r"(?i)^\s*color\s*:\s*(#fff(fff)?|#000(000)?|white|black|"
+                           r"rgba?\(\s*(255\s*,\s*255\s*,\s*255|0\s*,\s*0\s*,\s*0)\s*(,\s*[\d.]+\s*)?\))\s*$")
+
+
+def clean_style(match):
+    kept = [part for part in match.group(2).split(";")
+            if part.strip() and not DROPPED_STYLE.match(part) and not NEUTRAL_COLOR.match(part)]
+    return ' style=%s%s%s' % (match.group(1), ";".join(p.strip() for p in kept), match.group(1)) if kept else ""
+
+
+def repair_cloze(text):
+    """Cloze deletions with a single colon, as typed by hand: {{c1:answer}}, {{c1:answer:}} and
+    {{c1:<b>:answer}}. Anki shows them as plain text, but they are meant as clozes."""
+    text = re.sub(r"\{\{c(\d+):((?:<[^>]+>)*):(?!:)", r"{{c\1::\2", text)
+    text = re.sub(r"\{\{c(\d+):(?!:)(.*?):?\}\}", r"{{c\1::\2}}", text, flags=re.S)
+    # a single closing brace, maybe with the second one behind a tag: {{c1::answer}</b> or {{c1::answer}</b>}
+    return re.sub(r"(\{\{c\d+::[^{}]*?)\}(?!\})((?:\s*<[^>]+>)*)\}?", r"\1}}\2", text)
+
+
 def sanitize_html(text):
-    """Removes scripts, styles, event attributes and sound references from Anki HTML."""
+    """Removes scripts, styles, event attributes and sound references from Anki HTML, the styles of
+    other web pages (fonts, sizes, theme colours, <code> blocks pasted from a search page) and
+    repairs hand-typed clozes."""
     text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", text or "")
     text = re.sub(r"(?i)\s+on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", "", text)
     text = re.sub(r"\[sound:[^\]]*\]", "", text)
+    text = re.sub(r'(?i)\s+style=(["\'])(.*?)\1', clean_style, text)
+    text = re.sub(r"(?i)\s+(jsaction|jscontroller|jsuid|jsname|data-sfc-[a-z-]+|data-ved|class)=(\"[^\"]*\"|'[^']*')", "", text)
+    text = re.sub(r"(?i)<code(\s+dir=\"[^\"]*\")?>(.*?)</code>", r"<span>\2</span>", text, flags=re.S) \
+        if re.search(r"(?i)<code\s+dir=", text) else text
+    text = repair_cloze(text)
     return text.strip()
+
+
+def balance_tags(content):
+    """Splits HTML into (balanced content, leftover tags): a cloze can start inside one <span> and end
+    in the next - its highlight would then close the wrong element."""
+    stack = []
+    leftover = []
+    keep = []
+    for match in re.finditer(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*?(/?)>|[^<]+|<", content):
+        token = match.group(0)
+        if match.group(2) and not match.group(3) and match.group(2).lower() not in ("br", "img", "hr", "wbr"):
+            name = match.group(2).lower()
+            if match.group(1):
+                if stack and stack[-1][0] == name:
+                    stack.pop()
+                    keep.append(token)
+                else:
+                    leftover.append(token)
+                continue
+            stack.append((name, len(keep)))
+            keep.append(token)
+            continue
+        keep.append(token)
+    for name, index in reversed(stack):
+        leftover.insert(0, keep[index])
+        keep[index] = ""
+    return "".join(keep), "".join(leftover)
 
 
 def has_content(text):
@@ -132,7 +191,8 @@ def cloze_to_highlight(text):
         if number not in numbers:
             numbers.append(number)
         hint = ' data-hint="%s"' % html.escape(strip_html(match.group(3)), quote=True) if match.group(3) else ""
-        return '<span data-cloze="%d"%s style="%s">%s</span>' % (number, hint, HIGHLIGHT, match.group(2))
+        content, leftover = balance_tags(match.group(2))
+        return '<span data-cloze="%d"%s style="%s">%s</span>%s' % (number, hint, HIGHLIGHT, content, leftover)
     return CLOZE.sub(replace, text), numbers
 
 
