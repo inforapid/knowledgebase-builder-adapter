@@ -715,7 +715,10 @@ class KdbWriter(object):
         self.group_label = "Part %s · %s"
         self.touched = set()
         self.root_name = root_name
-        self.root = self.add_item(root_name, "", "", self.deck_template, [])
+        # Decks and groups are containers, not knowledge: "#nolearn" keeps the learning mode from asking
+        # "Which category does Part 3 belong to?" or "What belongs to Anatomy?"
+        self.nolearn = [self.template("#nolearn")]
+        self.root = self.add_item(root_name, "", "", self.deck_template, self.nolearn)
         self.user_id = self._user_id()
         self._create_learn_tables()
         self.learn_rows = 0
@@ -768,7 +771,7 @@ class KdbWriter(object):
             key = (deck_key, tuple(path))
             if key not in self.group_ids:
                 title = self.group_label % (".".join(str(p + 1) for p in path), shorten(label, 40))
-                self.group_ids[key] = self.add_item(title, "", "", self.deck_template, [])
+                self.group_ids[key] = self.add_item(title, "", "", self.deck_template, self.nolearn)
                 self.add_relation(parent, self.group_ids[key])
             parent = self.group_ids[key]
         return parent
@@ -796,7 +799,7 @@ class KdbWriter(object):
             path.append(part)
             key = "::".join(path).lower()
             if key not in self.deck_ids:
-                self.deck_ids[key] = self.add_item(part, "", "", self.deck_template, [])
+                self.deck_ids[key] = self.add_item(part, "", "", self.deck_template, self.nolearn)
                 self.add_relation(parent, self.deck_ids[key])
             parent = self.deck_ids[key]
         return parent
@@ -1139,6 +1142,7 @@ def import_text(args, db):
 DIAGRAM_PROPERTIES = {
     "dl": 1,       # layout: mind map radial (straight lines)
     "iex": 0,      # items collapsed - an expanded deck shows every answer at once
+    "lcp": "anki", # learning card profile: no category and parts cards (category = top deck, parts = decks)
 }
 
 

@@ -19,7 +19,7 @@ opened with the desktop and mobile apps or uploaded to the web version (*Upload 
 
 | Anki | KnowledgeBase Builder |
 | --- | --- |
-| deck and subdecks (`A::B::C`) | chain of items of the category `Deck` below a root item |
+| deck and subdecks (`A::B::C`) | chain of items of the category `Deck` below a root item; decks, groups and the root carry the tag `#nolearn`, so the learning mode asks nothing about the containers themselves |
 | note | item below its deck; decks with more than `--max-children` (25) notes are split into groups of 25 in Anki order, and into groups of groups when needed – the diagram loads about 100 items at once. A group is named after its number and the start of its first card (`--group-label`, e.g. `"Teil %s · %s"` → *Teil 3 · Glykolyse …*) |
 | first field (front) | name of the item, as plain text and shortened to `--max-name` characters |
 | `Back` / `Answer` field (otherwise the next field with content) | description of the item |
@@ -95,8 +95,10 @@ python anki_to_kbb.py import Deck.apkg --db deck.kdb
 
 `deck.kdb` is created from `empty.kdb`. The importer refuses to overwrite an existing database;
 `--append` adds the deck to one instead. A new database opens with the layout *Mind Map radial
-(straight lines)* and collapsed items, so that the answers stay hidden until an item is opened;
-`--append` leaves the formatting of the database as it is.
+(straight lines)* and collapsed items, so that the answers stay hidden until an item is opened, and it
+is marked as an Anki deck (`"lcp": "anki"` in the diagram properties): the learning mode then starts
+without category and parts cards – the category is only the top deck, the parts are decks and groups.
+Both can still be switched on in the learning dialog. `--append` leaves the database properties as they are.
 
 Text exports — Anki's *Notes in Plain Text* with its `#separator:` / `#deck column:` header lines,
 or Quizlet's *Export* with one `term<TAB>definition` per line:
@@ -139,9 +141,9 @@ Instead of a `.kdb`, a JSON file written by *Export JSON data* can be exported a
 | `export --deck NAME` | name of the topmost deck of the export (default: the root item) |
 
 The learning state is deliberately not turned into tags or categories (Leitner boxes): it changes with every
-review and per card. The app shows it live instead – the *knowledge map* colours every item by its state,
-and *Learn: whole database* in the learning dialog picks due and new cards regardless of what the diagram
-currently shows.
+review and per card. The app shows it live instead – the *knowledge map* colours every item by its state.
+As in Anki, the learning mode reviews due cards of the whole database, while new cards come from the
+selected branch in deck order (*New cards from: Branch of …*) – select a deck or a group and learn.
 
 ## Notes
 
