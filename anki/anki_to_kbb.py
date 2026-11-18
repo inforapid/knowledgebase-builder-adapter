@@ -47,26 +47,32 @@ except ImportError:
                      "obsidian/ directories side by side or copy obsidian_to_kbb.py next to this script.")
 
 try:
-    from PIL import Image as _Image
+    from PIL import Image as _Image, ImageDraw as _ImageDraw
 except ImportError:
     _Image = None
+    _ImageDraw = None
 
+import xml.etree.ElementTree as ET
 import music_notation  # noqa: E402  (next to this script)
 
-# Questions of melody notes (field "MelodyJSON"): the staff is the question, the syllables or the count
-# the answer. A question mark makes the learning mode ask them front -> back as a flashcard.
+# Questions of melody notes (field "MelodyJSON") and image occlusion notes: the image is the question,
+# the syllables/count or the uncovered label is the answer. A question mark makes the learning mode ask
+# them front -> back as a flashcard.
 MUSIC_TEXTS = {
     "en": {"sing": "Which syllables does this melody sing?", "rhythm": "How do you count this rhythm?",
+           "occlusion": "Which structure is marked?", "occlusion_answer": "Revealed in the image",
            "key": "Key", "time": "Time", "clef": "Clef", "first": "First note", "tonic": "Tonic",
            "notes": "Notes", "count": "Count", "degrees": "Scale degrees",
            "legend": "bold = clap, grey = hold, ( ) = rest", "audio": "The recordings of the Anki deck (cadence, first note, "
            "melody, drone) are not imported."},
     "de": {"sing": "Welche Silben singt diese Melodie?", "rhythm": "Wie zählst du diesen Rhythmus?",
+           "occlusion": "Welche Struktur ist markiert?", "occlusion_answer": "Im Bild aufgedeckt",
            "key": "Tonart", "time": "Takt", "clef": "Schlüssel", "first": "Anfangston", "tonic": "Grundton",
            "notes": "Noten", "count": "Zählweise", "degrees": "Stufen",
            "legend": "fett = klatschen, grau = aushalten, ( ) = Pause", "audio": "Die Tonaufnahmen des Anki-Stapels (Kadenz, "
            "Anfangston, Melodie, Bordun) werden nicht übernommen."},
     "es": {"sing": "¿Qué sílabas canta esta melodía?", "rhythm": "¿Cómo cuentas este ritmo?",
+           "occlusion": "¿Qué estructura está marcada?", "occlusion_answer": "Mostrada en la imagen",
            "key": "Tonalidad", "time": "Compás", "clef": "Clave", "first": "Primera nota", "tonic": "Tónica",
            "notes": "Notas", "count": "Conteo", "degrees": "Grados",
            "legend": "negrita = palmada, gris = mantener, ( ) = silencio", "audio": "Las grabaciones del mazo de Anki (cadencia, primera "
@@ -552,9 +558,125 @@ class MediaStore(object):
         self.jpeg_quality = 80
         self.by_name = read_media_map(package) if package is not None else {}
         self.cache = {}
+        self.base_images = {}
         self.embedded = 0
         self.skipped = 0
         self.missing = 0
+
+    def _raw_bytes(self, name):
+        entry = self.by_name.get(name) or self.by_name.get(html.unescape(name))
+        if entry is None or entry not in self.package.namelist():
+            self.missing += 1
+            return None
+        data = self.package.read(entry)
+        if is_zstd(data):
+            data = zstd_decompress(data)
+        return data
+
+    def _base_image(self, name, max_edge):
+        key = (name, max_edge)
+        if key not in self.base_images:
+            raw = self._raw_bytes(name)
+            if raw is None or _Image is None:
+                self.base_images[key] = None
+            else:
+                try:
+                    im = _Image.open(io.BytesIO(raw)).convert("RGBA")
+                    if max(im.size) > max_edge:
+                        im.thumbnail((max_edge, max_edge))
+                    self.base_images[key] = im
+                except Exception:
+                    self.base_images[key] = None
+        return self.base_images[key]
+
+    @staticmethod
+    def _svg_shapes(svg_bytes, width, height):
+        try:
+            root = ET.fromstring(svg_bytes)
+        except Exception:
+            return []
+        vb = root.attrib.get("viewBox", "").replace(",", " ").split()
+        vw = float(vb[2]) if len(vb) == 4 else float(re.sub(r"[^0-9.]", "", root.attrib.get("width", "")) or width)
+        vh = float(vb[3]) if len(vb) == 4 else float(re.sub(r"[^0-9.]", "", root.attrib.get("height", "")) or height)
+        sx, sy = (width / vw if vw else 1.0), (height / vh if vh else 1.0)
+        shapes = []
+        for el in root.iter():
+            tag = el.tag.split("}")[-1].lower()
+            fill = el.attrib.get("fill")
+            stroke = el.attrib.get("stroke", "#000000")
+            sw = max(1, round(float(re.sub(r"[^0-9.]", "", el.attrib.get("stroke-width", "1")) or 1.0) * ((sx + sy) / 2.0)))
+            if tag == "rect":
+                x = float(el.attrib.get("x", 0)) * sx
+                y = float(el.attrib.get("y", 0)) * sy
+                w = float(el.attrib.get("width", 0)) * sx
+                h = float(el.attrib.get("height", 0)) * sy
+                if w > 0 and h > 0:
+                    shapes.append(("rect", (round(x, 1), round(y, 1), round(x + w, 1), round(y + h, 1)), fill, stroke, sw))
+            elif tag in ("ellipse", "circle"):
+                cx = float(el.attrib.get("cx", 0)) * sx
+                cy = float(el.attrib.get("cy", 0)) * sy
+                rx = float(el.attrib.get("rx" if tag == "ellipse" else "r", 0)) * sx
+                ry = float(el.attrib.get("ry" if tag == "ellipse" else "r", 0)) * sy
+                if rx > 0 and ry > 0:
+                    shapes.append(("ellipse", (round(cx - rx, 1), round(cy - ry, 1), round(cx + rx, 1), round(cy + ry, 1)), fill, stroke, sw))
+        return shapes
+
+    def composite_occlusion(self, img_html, mask_html, max_edge, compare_mask_html=None):
+        """Composites an Image Occlusion base image with its SVG mask into a single high-resolution JPEG <img> tag."""
+        if not self.enabled:
+            return ""
+        img_match = re.search(r'<img[^>]*?src=["\']([^"\']+)["\']', img_html or "", re.I)
+        mask_match = re.search(r'<img[^>]*?src=["\']([^"\']+)["\']', mask_html or "", re.I)
+        cmp_match = re.search(r'<img[^>]*?src=["\']([^"\']+)["\']', compare_mask_html or "", re.I)
+        if not img_match:
+            return ""
+        img_name = img_match.group(1)
+        mask_name = mask_match.group(1) if mask_match else None
+        cmp_name = cmp_match.group(1) if cmp_match else None
+        style = 'class="kbb-io-img" style="display:block;margin:8px auto 0 auto;max-width:100%;max-height:58vh;border-radius:6px"'
+
+        if _Image is not None and _ImageDraw is not None and (mask_name or cmp_name):
+            base = self._base_image(img_name, max_edge)
+            mask_raw = self._raw_bytes(mask_name) if mask_name else None
+            cmp_raw = self._raw_bytes(cmp_name) if cmp_name else None
+            if base is not None and (mask_raw is not None or cmp_raw is not None):
+                canvas = base.copy()
+                draw = _ImageDraw.Draw(canvas)
+                shapes = self._svg_shapes(mask_raw, canvas.width, canvas.height) if mask_raw else []
+                cmp_shapes = self._svg_shapes(cmp_raw, canvas.width, canvas.height) if cmp_raw else []
+                if not shapes and cmp_shapes:
+                    # Deck without a separate Answer Mask: keep non-red masks and leave the red target unmasked
+                    for kind, box, fill, stroke, sw in cmp_shapes:
+                        if fill and fill.upper() in ("#FF0000", "#F00", "RED", "#FF2D2D", "#E53935"):
+                            continue
+                        elif kind == "ellipse":
+                            draw.ellipse(box, fill=fill or "#FFEBA2", outline=stroke, width=sw)
+                        else:
+                            draw.rectangle(box, fill=fill or "#FFEBA2", outline=stroke, width=sw)
+                else:
+                    for kind, box, fill, stroke, sw in shapes:
+                        if kind == "ellipse":
+                            draw.ellipse(box, fill=fill or "#FFEBA2", outline=stroke, width=sw)
+                        else:
+                            draw.rectangle(box, fill=fill or "#FFEBA2", outline=stroke, width=sw)
+                buf = io.BytesIO()
+                canvas.convert("RGB").save(buf, format="JPEG", quality=self.jpeg_quality, optimize=True)
+                data = buf.getvalue()
+                if len(data) <= self.max_bytes:
+                    self.embedded += 1
+                    uri = "data:image/jpeg;base64,%s" % base64.b64encode(data).decode("ascii")
+                    return '<img src="%s" %s>' % (uri, style)
+
+        # Fallback without Pillow: stack base image and SVG mask via CSS positioning
+        base_uri = self.data_uri(img_name, max_edge)
+        mask_uri = self.data_uri(mask_name, max_edge) if mask_name else None
+        if base_uri and mask_uri:
+            return ('<span style="position:relative;display:inline-block"><img src="%s" %s>'
+                    '<img src="%s" style="position:absolute;left:0;top:0;width:100%%;height:100%%"></span>'
+                    % (base_uri, style, mask_uri))
+        if base_uri:
+            return '<img src="%s" %s>' % (base_uri, style)
+        return ""
 
     def _load(self, name, max_edge):
         entry = self.by_name.get(name) or self.by_name.get(html.unescape(name))
@@ -1013,6 +1135,7 @@ def import_package(args, db):
             answer_fields = [lower_names.index(t.lower()) for t in notetype.get("templates", []) if t.lower() in lower_names]
             field_cards = (len(answer_fields) >= 2) and not notetype["cloze"]
 
+            group_title = None
             name_html = None
             if melody is not None:
                 stats["melodies"] += 1
@@ -1050,10 +1173,59 @@ def import_package(args, db):
                 stats["imageOcclusion"] += 1
                 header = field_index(names, ["header", "kopfzeile", "titel", "title"])
                 image = field_index(names, ["image", "bild"])
-                label = strip_html(raw[header]) if header >= 0 else ""
-                label = label or "Image Occlusion %d" % stats["imageOcclusion"]
-                description = raw[image] if image >= 0 else ""
-                used.update(i for i in (header, image) if i >= 0)
+                qmask = field_index(names, ["question mask", "fragemaske", "mask", "masks"])
+                amask = field_index(names, ["answer mask", "antwortmaske"])
+                remarks = field_index(names, ["remarks", "anmerkungen", "back extra", "kommentar", "comments"])
+                extra1 = field_index(names, ["extra 1", "extra1"])
+                extra2 = field_index(names, ["extra 2", "extra2"])
+                footer = field_index(names, ["footer", "fußzeile"])
+
+                header_text = strip_html(raw[header]) if header >= 0 else ""
+                group_title = header_text or ("Image Occlusion %d" % stats["imageOcclusion"])
+                label = header_text or group_title
+
+                io_edge = max(args.note_image_edge, 800)
+                img_html = raw[image] if image >= 0 else ""
+                qmask_html = raw[qmask] if qmask >= 0 else ""
+                amask_html = raw[amask] if amask >= 0 else ""
+                q_img = media.composite_occlusion(img_html, qmask_html, io_edge) if qmask_html else media.embed(img_html, io_edge)
+                a_img = media.composite_occlusion(img_html, amask_html, io_edge, compare_mask_html=qmask_html) \
+                    if (amask_html or qmask_html) else ""
+
+                ans_parts = []
+                remarks_plain = strip_html(raw[remarks]) if (remarks >= 0 and has_content(raw[remarks])) else ""
+                if remarks_plain:
+                    ans_parts.append(raw[remarks])
+                    used.add(remarks)
+                    # Extra 1 / Extra 2 often repeat the heading and body of Remarks
+                    for ext in (extra1, extra2):
+                        if ext >= 0 and strip_html(raw[ext]) and strip_html(raw[ext]) in remarks_plain:
+                            used.add(ext)
+                else:
+                    if extra1 >= 0 and has_content(raw[extra1]):
+                        ans_parts.append("<b>%s</b>" % raw[extra1])
+                        used.add(extra1)
+                    if extra2 >= 0 and has_content(raw[extra2]):
+                        ans_parts.append(raw[extra2])
+                        used.add(extra2)
+                if not ans_parts:
+                    ans_parts.append(html.escape(header_text or texts["occlusion_answer"]))
+
+                short_ans = strip_html(raw[extra1]) if (extra1 >= 0 and strip_html(raw[extra1])) else ""
+                if not short_ans and remarks >= 0:
+                    first_line = re.split(r"(?i)<br\s*/?>|</p>|</div>|\n", raw[remarks] or "")[0]
+                    short_ans = shorten(strip_html(first_line), 45)
+                node_suffix = ('<span class="kbb-io-node-label"> · %s</span>' % html.escape(short_ans)) if short_ans else ""
+                header_div = ("<div>%s%s</div>" % (html.escape(header_text), node_suffix)) if header_text else (
+                    ("<div>%s</div>" % node_suffix) if node_suffix else "")
+                footer_html = ("<div style=\"font-size:0.85em;color:#666;margin-top:4px\">%s</div>" % raw[footer]) \
+                    if (footer >= 0 and has_content(raw[footer])) else ""
+                name_html = "<html>%s%s%s</html>" % (header_div, q_img, footer_html)
+                if short_ans and header_text:
+                    label = "%s · %s" % (header_text, short_ans)
+
+                description = "<div>%s</div>%s" % ("<br>".join(ans_parts), a_img)
+                used.update(i for i in (header, image, qmask, amask, footer) if i >= 0)
                 front_full = ""
             elif notetype["cloze"] or is_cloze(raw[:1]):
                 stats["cloze"] += 1
@@ -1079,16 +1251,22 @@ def import_package(args, db):
                 label = strip_html(raw[front])
                 description = raw[back] if back >= 0 else ""
                 used.update(i for i in (front, back) if i >= 0)
-                front_full = raw[front]
+                if "<img" in (raw[front] or "").lower():
+                    name_html = "<html>%s</html>" % media.embed(raw[front], max(args.note_image_edge, 960))
+                    front_full = ""
+                else:
+                    front_full = raw[front]
 
             if not label and not has_content(description):
                 stats["empty"] += 1
                 continue
 
+            name_limit = max(args.max_name, 220) if label.endswith("?") else args.max_name
+
             # Note: the complete front (when the name is shortened or formatted), then all remaining
             # fields with their names
             sections = []
-            if front_full and (len(label) > args.max_name or front_full != html.escape(label)):
+            if front_full and (len(label) > name_limit or front_full != html.escape(label)):
                 sections.append(note_section(names[0], front_full))
             for index, content in enumerate(raw):
                 if index not in used and has_content(content):
@@ -1116,12 +1294,12 @@ def import_package(args, db):
             deck_key = cards[0]["deck"] if cards else None
             position = deck_positions.get(deck_key, 0)
             deck_positions[deck_key] = position + 1
-            parent = writer.group_parent(parent, deck_key, position, deck_totals.get(deck_key, 0), label)
+            parent = writer.group_parent(parent, deck_key, position, deck_totals.get(deck_key, 0), group_title or label)
 
             if name_html:
                 item_id = writer.add_item(name_html, description, note_html, category_id, tag_ids, search_text=label)
             else:
-                item_id = writer.add_item(shorten(label, args.max_name) or "(no text)", description, note_html,
+                item_id = writer.add_item(shorten(label, name_limit) or "(no text)", description, note_html,
                                           category_id, tag_ids)
             writer.add_relation(parent, item_id)
             stats["notes"] += 1
